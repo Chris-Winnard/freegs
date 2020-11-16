@@ -3,7 +3,7 @@ Defines class to represent the equilibrium
 state, including plasma and coil currents
 """
 
-from numpy import pi, meshgrid, linspace, exp, zeros, nditer, array
+from numpy import pi, meshgrid, linspace, exp, zeros, nditer, array, log
 import numpy as np
 from scipy import interpolate
 from scipy.integrate import romb, quad # Romberg integration
@@ -13,6 +13,7 @@ from . import critical
 
 # Operators which define the G-S equation
 from .gradshafranov import mu0, GSsparse, GSsparse4thOrder
+from .polygons import intersect
 
 # Multigrid solver
 from . import multigrid
@@ -213,12 +214,142 @@ class Equilibrium:
         # Integrate volume in 2D
         return romb(romb(dV))
     
-    def plasmaBr(self, R,Z):
+    def plasmaArea(self):
+        """Calculate the area of the plasma in m^2"""
+
+        dR = self.R[1,0] - self.R[0,0]
+        dZ = self.Z[0,1] - self.Z[0,0]
+        
+        #Area element:
+        dA = dR * dZ
+        
+        if self.mask is not None:   # Only include points in the core
+            dA *= self.mask
+        
+        # Integrate area in 2D
+        return romb(romb(dA))
+    
+    def AverageElDensity(self, npoints=300):
+        #Calculate the average electron density, based on the prediction for ITER of 0.85n_{GW},
+        #in measurements of 10^20 m^-3. A conversion factor of 10^-6 will be used to convert current from A to MA."
+        numerator = 0.85*self.plasmaCurrent()*1e-6 #self.plasmaCurrent()*1e-6
+        denominator = np.pi*self.minorRadius(npoints=npoints)**2 #np.pi*self.minorRadius()**2
+        return numerator/denominator
+    
+    def AverageDT_IonDensities(self): #Measurements of 10^20 m^-3.
+        Dplus_density = self.AverageElDensity()*0.425
+        Tplus_density = Dplus_density
+        return [Dplus_density, Tplus_density]
+    
+    def AverageImpurityDensity(self):
+        #Calculates the average density of ALL impurities, measurements of 10^20 m^-3.
+        Z_imp = 8 #Assumed average impurity charge.
+        return (self.AverageElDensity() - sum(self.AverageDT_IonDensities()))/Z_imp
+    
+    def AverageTotDensity(self):
+        #Total particle density, measurements of 10^20 m^-3.
+        return self.AverageElDensity() + sum(self.AverageDT_IonDensities()) + self.AverageImpurityDensity()          
+        
+    def AveragePlasmaPressure(self):
+        #Find <p> for all particles, in Pa, through 2D integration. This largely combines code from the plasmaVolume and
+        #poloidalBeta functions.
+        dR = self.R[1,0] - self.R[0,0]
+        dZ = self.Z[0,1] - self.Z[0,0]
+    
+        #Volume element
+        dV = 2.*pi*self.R * dR * dZ
+            
+        if self.mask is not None:   # Only include points in the core
+            dV *= self.mask
+            
+            psi_norm = (self.psi() - self.psi_axis)  / (self.psi_bndry - self.psi_axis)
+
+        # Plasma pressure:
+        pressure = self.pressure(psi_norm)
+        if self.mask is not None:
+            # Applies if there's a masking function (X-points, limiters):
+            pressure *= self.mask
+            
+        return romb(romb(pressure*dV))/self.plasmaVolume()
+    
+    def AverageTemperature(self):
+        #Ideal gas law, using the average pressure, total average density, a conversion factor to bring density
+        #into units of m^3 (i.e multiplying by 10^20), and Boltzmann's constant. The answer is in K.
+        return self.AveragePlasmaPressure()/(self.AverageTotDensity()*1e20*1.380649*1e-23)
+    
+    def ElDensityRatio(self):
+        #Calculates the terms individually (including finding their signs!) and then sums them up for the ratio. Note that
+        #for ICRH-heated, metal-walled machines it may be best to subtract 0.1 for a more accurate value.
+        Zeff = 1.5
+        EffectiveCollisionality = 0.1*Zeff*self.AverageElDensity()*10*self.Rgeometric()/((self.AverageTemperature()*8.617328149741*1e-8)**2)
+        #Conversion factor of 10 to bring <n_e> from 10^20 m^3 to 10^19 m^3. Also, converted T from K -> keV before squaring it.
+        SecondTerm = -0.117*np.log(EffectiveCollisionality)
+        
+        CoreNBI_Flux = 0.077
+        ThirdTerm = 1.33*CoreNBI_Flux
+        FourthTerm = -4.03*self.toroidalBeta()         
+        
+        return 1.347 + SecondTerm + ThirdTerm + FourthTerm
+        
+    def PeakElDensity(self):
+        return self.ElDensityRatio()*self.AverageElDensity()
+    
+    def PeakDT_IonDensities(self): #Because of complications involving impurities, 0.1 needs to be subtracted from the electron
+        #density ratio to give the ion density ratio. Otherwise the function is very similar to PeakElectronDensity.
+        return (self.ElDensityRatio()-0.1)*self.AverageDT_IonDensities()
+    
+    def PeakImpurityDensity(self): #Assumes there are no neutral impurities. Almost identical to PeakDT_IonDensity.
+        return (self.ElDensityRatio()-0.1)*self.AverageImpurityDensity()
+    
+    def PeakTotDensity(self):
+        return self.PeakElDensity + sum(self.PeakDT_IonDensities()) + self.PeakImpurityDensity()
+  
+    def plasmaW(self): #Calculates W by integrating 1.5*nkT, where n is the total particle density and T is in K,
+        #with respect to volume. For now, AVERAGE n and T values are being used, but nkT is equivalent to p(psi).
+        dR = self.R[1,0] - self.R[0,0]
+        dZ = self.Z[0,1] - self.Z[0,0]
+    
+        #Volume element:
+        dV = 2.*pi*self.R * dR * dZ
+            
+        if self.mask is not None:   # Only include points in the core
+            dV *= self.mask
+            psi_norm = (self.psi() - self.psi_axis)  / (self.psi_bndry - self.psi_axis)
+
+        # Plasma pressure:
+        pressure = self.pressure(psi_norm)
+        if self.mask is not None:
+            # Applies if there's a masking function (X-points, limiters):
+            pressure *= self.mask
+        
+        return romb(romb(1.5*pressure))
+  
+    def tauE_Coeffs(self): #EXCLUDING THE LOSS POWER FACTOR, this is the ITERH-98P(y, 2) scaling law for tau_Es.
+        #tauE = tauE_Coeffs*P_L**-0.69
+        
+        CurrentTerm = (self.plasmaCurrent()*1e-6)**0.93 #Conversion factor of 1e-6 for current (A -> MA).
+        RgeoTerm = self.Rgeometric()**1.97
+        InvAspectRatioTerm = self.aspectRatio()**-0.93 #Inverse aspect ratio ^0.93
+        ElongationTerm = self.effectiveElongation()**0.78
+        BtorTerm = self.Btor(self.magneticAxis()[0], self.magneticAxis()[1])**0.15 #B_tor on the magnetic axis ^0.15.
+        DensityTerm = (10*self.AverageElDensity())**0.41 #Used a conversion factor for e- density (10^20m^-3 -> 10^19m^-3).
+        DTMassTerm = 2.513954854**0.19 #Average D-T ion mass in Da ^0.19.
+        
+        return 0.0562*CurrentTerm*RgeoTerm*InvAspectRatioTerm*ElongationTerm*BtorTerm*DensityTerm*DTMassTerm
+        
+    def PowerL(self): #Uses an equation derived from the scaling law, and the definition of tau_E.
+        Numerator = (self.plasmaW()*1e-6) #Conversion factor of 1e6 for J -> MJ.
+        return (Numerator/self.tauE_Coeffs())**(100/31)
+    
+    def tauE(self):
+        return (self.PowerL()**(-0.69))*self.tauE_Coeffs()
+    
+    def plasmaBr(self, R, Z):
         """
         Radial magnetic field due to plasma
         Br = -1/R dpsi/dZ
         """
-        return -self.psi_func(R,Z,dy=1, grid=False)/R
+        return -self.psi_func(R,Z,dy=1, grid=False)/R   
         
     def plasmaBz(self, R, Z):
         """
@@ -520,7 +651,7 @@ class Equilibrium:
         separatrix = self.separatrix() # Array [:,2]
         wall = self.tokamak.wall # Wall object with R and Z members (lists)
         
-        return polygons.intersect(separatrix[:,0], separatrix[:,1],
+        return intersect(separatrix[:,0], separatrix[:,1],
                                   wall.R, wall.Z)
         
     def magneticAxis(self):
@@ -576,21 +707,22 @@ class Equilibrium:
         """
         return self.Rgeometric(npoints=npoints)/ self.minorRadius(npoints=npoints)
 
-    def effectiveElongation(self, R_wall_inner, R_wall_outer, npoints=300):
+    def effectiveElongation(self, npoints=300):
         """Calculates plasma effective elongation using the plasma volume
 
         """
-        return self.plasmaVolume()/(2.*np.pi * self.Rgeometric(npoints=npoints) * self.minorRadius(npoints=npoints)**2)
+        return self.plasmaArea()/(np.pi * self.minorRadius(npoints=npoints)**2)
     
     def internalInductance1(self, npoints=300):
         """Calculates li1 plasma internal inductance
 
         """
-        # Produce array of Bpol^2 in (R,Z)
-        B_polvals_2 = self.Bz(self.R,self.Z)**2 + self.Br(R,Z)**2
-
+        
         R = self.R
         Z = self.Z
+        # Produce array of Bpol^2 in (R,Z)
+        B_polvals_2 = self.Bz(self.R,self.Z)**2 + self.Br(R,Z)**2
+        
         dR = R[1,0] - R[0,0]
         dZ = Z[0,1] - Z[0,0]
         dV = 2. * np.pi * R * dR * dZ
@@ -613,8 +745,6 @@ class Equilibrium:
 
         R = self.R
         Z = self.Z
-        psi = self.psi()
-
         # Produce array of Bpol in (R,Z)
         B_polvals_2 = self.Br(R,Z)**2 + self.Bz(R,Z)**2
 
@@ -637,8 +767,6 @@ class Equilibrium:
 
         R = self.R
         Z = self.Z
-        psi = self.psi()
-
         # Produce array of Bpol in (R,Z)
         B_polvals_2 = self.Br(R,Z)**2 + self.Bz(R,Z)**2
 
@@ -683,8 +811,6 @@ class Equilibrium:
         pressure_integral = romb(romb(pressure * dV))
         field_integral_pol = romb(romb(B_polvals_2 * dV))
         return 2 * mu0 * pressure_integral / field_integral_pol
-        
-        return poloidal_beta
 
     def toroidalBeta(self):
         """Calculate plasma toroidal beta by integrating the thermal pressure
